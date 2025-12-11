@@ -68,6 +68,19 @@ async function run() {
       const result = await booksCollection.find(query).toArray();
       res.send(result);
     });
+
+    app.get("/latest-books", async (req, res) => {
+      const limit = 6;
+      const query = { status: "published" };
+      const result = await booksCollection
+        .find(query)
+        .sort({ _id: -1 })
+        .limit(limit) 
+        .toArray();
+
+      res.send(result);
+    });
+
     //get a single book
     app.get("/books/:id", async (req, res) => {
       const id = req.params.id;
