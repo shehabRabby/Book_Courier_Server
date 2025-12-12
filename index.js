@@ -214,8 +214,9 @@ async function run() {
       };
       const result = await ordersCollection.updateOne(query, updateDoc);
       res.send(result);
-    }); //get all published books from db
+    });
 
+    //get all published books from db
     app.get("/books", async (req, res) => {
       const query = { status: "published" };
       const result = await booksCollection.find(query).toArray();
@@ -238,7 +239,7 @@ async function run() {
       const id = req.params.id;
       const result = await booksCollection.findOne({ _id: new ObjectId(id) });
       res.send(result);
-    }); // Send a ping to confirm a successful connection
+    });
 
     // In your server.js or ordersRoutes.js
 
@@ -259,6 +260,81 @@ async function run() {
       } catch (error) {
         console.error("Error fetching invoices:", error);
         res.status(500).send({ message: "Failed to fetch paid orders." });
+      }
+    });
+
+    // --- ⭐ NEW ENDPOINT: GET ALL BOOKS ADDED BY USER EMAIL (LIBRARIAN) ---
+    app.get("/my-books/:email", async (req, res) => {
+      const userEmail = req.params.email;
+
+      if (!userEmail) {
+        return res
+          .status(400)
+          .send({ message: "Email parameter is required." });
+      }
+
+      try {
+        // Assuming the book data includes a field like 'authorEmail' or 'librarianEmail'
+        // For simplicity, I will assume the book has an 'email' field storing the adder's email.
+        const query = { "seller_libarien.email": userEmail };
+        const myBooks = await booksCollection
+          .find(query)
+          .sort({ _id: -1 }) // Show latest added books first
+          .toArray();
+
+        res.send(myBooks);
+      } catch (error) {
+        console.error("Error fetching librarian's books:", error);
+        res.status(500).send({ message: "Failed to fetch books." });
+      }
+    });
+
+    // --- ⭐ NEW ENDPOINT: UPDATE BOOK STATUS (PUBLISH/UNPUBLISH) ---
+    app.patch("/books/status/:id", async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body; // Expecting status: 'published' or 'unpublished'
+
+      if (!status || (status !== "published" && status !== "unpublished")) {
+        return res.status(400).send({ message: "Invalid status provided." });
+      }
+
+      try {
+        const result = await booksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: status } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "Book not found." });
+        }
+        res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
+      } catch (error) {
+        console.error("Error updating book status:", error);
+        res.status(500).send({ message: "Failed to update book status." });
+      }
+    });
+
+    // --- ⭐ NEW ENDPOINT: UPDATE BOOK BY ID (PATCH) ---
+    app.patch("/books/:id", async (req, res) => {
+      const id = req.params.id;
+      const updatedBookData = req.body;
+
+      // Remove _id from the body to prevent MongoDB error
+      delete updatedBookData._id;
+
+      try {
+        const result = await booksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updatedBookData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "Book not found." });
+        }
+        res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
+      } catch (error) {
+        console.error("Error updating book:", error);
+        res.status(500).send({ message: "Failed to update book." });
       }
     });
 
