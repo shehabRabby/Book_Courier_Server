@@ -224,12 +224,55 @@ async function run() {
       await updateRole(req, res, "admin");
     }); // 1. Get all published books (least specific, but safe here)
 
-    // --- BOOK ENDPOINTS (Read Operations) ---
+    // --- BOOK ENDPOINTS (Paginated & Filtered) ---
     app.get("/books", async (req, res) => {
-      const query = { status: "published" };
-      const result = await booksCollection.find(query).toArray();
-      res.send(result);
-    }); // 2. Get latest published books (specific prefix)
+      // 1. Get query parameters from the frontend request
+      const page = parseInt(req.query.page) || 0; // The current page index (starts at 0)
+      const size = parseInt(req.query.size) || 10; // How many books to show per page
+      const search = req.query.search;
+      const category = req.query.category;
+      const rating = req.query.rating;
+
+      // 2. Build the query object (always include status: published)
+      let query = { status: "published" };
+
+      // 🔍 Dynamic Search (Title or Author)
+      if (search && search !== "undefined") {
+        query.$or = [
+          { bookTitle: { $regex: search, $options: "i" } },
+          { authorName: { $regex: search, $options: "i" } },
+        ];
+      }
+
+      // 📂 Category Filter
+      if (category && category !== "undefined" && category !== "") {
+        query.category = category;
+      }
+
+      // ⭐ Rating Filter (Greater than or equal to)
+      if (rating && rating !== "0") {
+        query.rating = { $gte: parseFloat(rating) };
+      }
+
+      try {
+        // 3. Execute the paginated query
+        // .skip() skips the items from previous pages
+        // .limit() restricts the result to the "size" variable
+        const result = await booksCollection
+          .find(query)
+          .skip(page * size)
+          .limit(size)
+          .toArray();
+
+        // 4. Get the TOTAL count of documents matching the query (for the UI buttons)
+        const count = await booksCollection.countDocuments(query);
+
+        // 5. Send back both the data and the total count
+        res.send({ result, count });
+      } catch (error) {
+        res.status(500).send({ message: "Error fetching books", error });
+      }
+    });
 
     app.get("/latest-books", async (req, res) => {
       const limit = 6;
