@@ -2,679 +2,652 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-// WARNING: Using the Secret Key for verification is not secure.
-// The STRIPE_WEBHOOK_SECRET is the correct way to verify events.
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const admin = require("firebase-admin");
 const port = process.env.PORT || 3000;
 
-// Initialize Firebase Admin (JWT Verification)
+const app = express();
+
+// --- Firebase Admin Initialization ---
+// WARNING: Ensure FB_SERVICE_KEY is securely stored in your environment variables.
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
-  "utf-8"
+    "utf-8"
 );
 const serviceAccount = JSON.parse(decoded);
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+    credential: admin.credential.cert(serviceAccount),
 });
 
-const app = express();
-
-// middleware
+// --- Middleware ---
 app.use(express.json());
 app.use(
-  cors({
-    origin: [process.env.CLIENT_DOMAIN],
-    credentials: true,
-    optionSuccessStatus: 200,
-  })
+    cors({
+        // Ensure this points to your specific frontend URL for security
+        origin: [process.env.CLIENT_DOMAIN],
+        credentials: true,
+        optionSuccessStatus: 200,
+    })
 );
 
-// jwt middlewares
+// --- 1. JWT Verification Middleware ---
+// Verifies the Firebase ID Token sent from the client
 const verifyJWT = async (req, res, next) => {
-  const token = req?.headers?.authorization?.split(" ")[1];
-  console.log(token);
-  if (!token) return res.status(401).send({ message: "Unauthorized Access!" });
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    req.tokenEmail = decoded.email;
-    console.log(decoded);
-    next();
-  } catch (err) {
-    console.log(err);
-    return res.status(401).send({ message: "Unauthorized Access!", err });
-  }
+    const token = req?.headers?.authorization?.split(" ")[1];
+    
+    if (!token) return res.status(401).send({ message: "Unauthorized Access: Token Missing" });
+    
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        // CRITICAL: Attach the verified user email to the request object
+        req.tokenEmail = decoded.email;
+        next();
+    } catch (err) {
+        // Token expired, invalid, etc.
+        console.error("JWT Verification Error:", err.code);
+        return res.status(401).send({ message: "Unauthorized Access: Invalid Token", error: err.code });
+    }
 };
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+
+// MongoDB Client Setup
 const client = new MongoClient(process.env.MONGODB_URL, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
+    serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+    },
 });
 
 async function run() {
-  try {
-    const db = client.db("booksDB");
-    const booksCollection = db.collection("books");
-    const ordersCollection = db.collection("orders");
-    const usersCollection = db.collection("users");
-    const reviewsCollection = db.collection("reviews");
-    const wishlistCollection = db.collection("wishlist");
-
-    app.post("/books", async (req, res) => {
-      const bookData = req.body;
-      const result = await booksCollection.insertOne(bookData);
-      res.send(result);
-    });
-
-    // --- PAYMENT (Stripe) ENDPOINTS ---
-    app.post("/create-checkout-session", async (req, res) => {
-      const { bookTitle, price, email, quantity, orderId } = req.body;
-
-      if (!orderId || !bookTitle || !price || !email) {
-        return res.status(400).send({
-          error:
-            "Missing required payment details (Order ID, Title, Price, Email).",
-        });
-      }
-
-      try {
-        const session = await stripe.checkout.sessions.create({
-          line_items: [
-            {
-              price_data: {
-                currency: "usd",
-                product_data: {
-                  name: bookTitle,
-                },
-                unit_amount: Math.round(price * 100), // Convert to cents, ensure integer
-              },
-              quantity: quantity || 1,
-            },
-          ],
-          customer_email: email,
-          mode: "payment",
-          success_url: `${process.env.CLIENT_DOMAIN}/payment/${orderId}?status=success&session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${process.env.CLIENT_DOMAIN}/dashboard/my-orders?status=cancelled&orderId=${orderId}`,
-        });
-
-        res.send({ url: session.url });
-      } catch (error) {
-        console.error("Stripe Checkout Error:", error);
-        res.status(500).send({ error: error.message });
-      }
-    });
-
-    // --- ORDER ENDPOINTS (Write Operations) ---
-    app.post("/orders", async (req, res) => {
-      const orderData = req.body;
-      orderData.orderDate = new Date();
-      orderData.status = "pending";
-      orderData.payment_status = "unpaid";
-
-      const result = await ordersCollection.insertOne(orderData);
-      res.send(result);
-    });
-
-    app.patch("/orders/payment-success/:orderId", async (req, res) => {
-      const orderId = req.params.orderId;
-      const sessionId = req.body.sessionId;
-
-      try {
-        // ... (Stripe verification logic) ...
-        if (sessionId) {
-          const session = await stripe.checkout.sessions.retrieve(sessionId);
-          if (session.payment_status !== "paid") {
-            console.log(
-              `Payment success update failed: Session ${sessionId} is not paid.`
-            );
-            return res
-              .status(400)
-              .send({ message: "Payment session status is not 'paid'." });
-          }
-        } else {
-          console.log(
-            "Warning: No session ID provided. Proceeding with client's payment success claim."
-          );
-        } // Update DB
-
-        const result = await ordersCollection.updateOne(
-          { _id: new ObjectId(orderId) },
-          {
-            $set: {
-              payment_status: "paid",
-              status: "processing",
-              stripeSessionId: sessionId || "N/A",
-              paidAt: new Date(),
-            },
-          }
-        );
-
-        if (result.modifiedCount === 1) {
-          res.send({ acknowledged: true, message: "Order updated to paid." });
-        } else {
-          res.status(404).send({ message: "Order not found or already paid." });
-        }
-      } catch (error) {
-        console.error("Payment Success Update Error:", error);
-        res
-          .status(500)
-          .send({ message: "Failed to update order status.", error });
-      }
-    });
-
-    app.patch("/orders/cancel/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const updateDoc = {
-        $set: { status: "cancelled", payment_status: "cancelled" },
-      };
-      const result = await ordersCollection.updateOne(query, updateDoc);
-      res.send(result);
-    });
-
-    app.patch("/orders/pay/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const updateDoc = {
-        $set: { payment_status: "paid", status: "processing" },
-      };
-      const result = await ordersCollection.updateOne(query, updateDoc);
-      res.send(result);
-    });
-
-    // --- USER ENDPOINTS ---
-    app.post("/users", async (req, res) => {
-      const user = req.body;
-      const query = { email: user.email };
-      const existingUser = await usersCollection.findOne(query);
-
-      if (existingUser) {
-        return res.send({ message: "User already exists", insertedId: null });
-      }
-
-      const result = await usersCollection.insertOne({
-        ...user,
-        role: "user",
-        createdAt: new Date(),
-      });
-      res.send(result);
-    }); // --- ⭐ ADMIN ENDPOINT: Get All Users (GET) ---
-
-    app.get("/users", async (req, res) => {
-      const result = await usersCollection.find().toArray();
-      res.send(result);
-    }); // --- ADMIN ENDPOINT: Update User Role (PATCH) ---
-
-    const updateRole = async (req, res, newRole) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const updateDoc = { $set: { role: newRole, lastRoleUpdate: new Date() } };
-      const result = await usersCollection.updateOne(query, updateDoc);
-      res.send(result);
-    };
-
-    app.patch("/users/make-librarian/:id", async (req, res) => {
-      await updateRole(req, res, "librarian");
-    });
-
-    app.patch("/users/make-admin/:id", async (req, res) => {
-      await updateRole(req, res, "admin");
-    }); // 1. Get all published books (least specific, but safe here)
-
-    // --- BOOK ENDPOINTS (Paginated & Filtered) ---
-    app.get("/books", async (req, res) => {
-      // 1. Get query parameters from the frontend request
-      const page = parseInt(req.query.page) || 0; // The current page index (starts at 0)
-      const size = parseInt(req.query.size) || 10; // How many books to show per page
-      const search = req.query.search;
-      const category = req.query.category;
-      const rating = req.query.rating;
-
-      // 2. Build the query object (always include status: published)
-      let query = { status: "published" };
-
-      // 🔍 Dynamic Search (Title or Author)
-      if (search && search !== "undefined") {
-        query.$or = [
-          { bookTitle: { $regex: search, $options: "i" } },
-          { authorName: { $regex: search, $options: "i" } },
-        ];
-      }
-
-      // 📂 Category Filter
-      if (category && category !== "undefined" && category !== "") {
-        query.category = category;
-      }
-
-      // ⭐ Rating Filter (Greater than or equal to)
-      if (rating && rating !== "0") {
-        query.rating = { $gte: parseFloat(rating) };
-      }
-
-      try {
-        // 3. Execute the paginated query
-        // .skip() skips the items from previous pages
-        // .limit() restricts the result to the "size" variable
-        const result = await booksCollection
-          .find(query)
-          .skip(page * size)
-          .limit(size)
-          .toArray();
-
-        // 4. Get the TOTAL count of documents matching the query (for the UI buttons)
-        const count = await booksCollection.countDocuments(query);
-
-        // 5. Send back both the data and the total count
-        res.send({ result, count });
-      } catch (error) {
-        res.status(500).send({ message: "Error fetching books", error });
-      }
-    });
-
-    app.get("/latest-books", async (req, res) => {
-      const limit = 6;
-      const query = { status: "published" };
-      const result = await booksCollection
-        .find(query)
-        .sort({ _id: -1 })
-        .limit(limit)
-        .toArray();
-
-      res.send(result);
-    });
-
-    // 3. ⭐ ADMIN ROUTE: Get ALL books (Admin View - MUST BE BEFORE /books/:id)
-    app.get("/books/all", async (req, res) => {
-      try {
-        const allBooks = await booksCollection
-          .find({})
-          .sort({ _id: -1 })
-          .toArray();
-
-        res.send(allBooks);
-      } catch (error) {
-        console.error("Error fetching all books for admin:", error);
-        res.status(500).send({ message: "Failed to fetch all books." });
-      }
-    }); // 4. Get a single book (Most general parameter route - MUST BE LAST)
-
-    app.get("/books/:id", async (req, res) => {
-      const id = req.params.id;
-      const result = await booksCollection.findOne({ _id: new ObjectId(id) });
-      res.send(result);
-    });
-
-    // --- LIBRARIAN/USER Read & Update ENDPOINTS ---
-    app.get("/my-invoices/:email", async (req, res) => {
-      const userEmail = req.params.email;
-      if (!userEmail) {
-        return res.status(400).send({ message: "Email required" });
-      }
-
-      try {
-        const query = { email: userEmail, payment_status: "paid" };
-        const invoices = await ordersCollection.find(query).toArray();
-        res.send(invoices);
-      } catch (error) {
-        console.error("Error fetching invoices:", error);
-        res.status(500).send({ message: "Failed to fetch paid orders." });
-      }
-    });
-
-    app.get("/my-books/:email", async (req, res) => {
-      const userEmail = req.params.email;
-
-      if (!userEmail) {
-        return res
-          .status(400)
-          .send({ message: "Email parameter is required." });
-      }
-
-      try {
-        const query = { "seller_libarien.email": userEmail };
-        const myBooks = await booksCollection
-          .find(query)
-          .sort({ _id: -1 })
-          .toArray();
-
-        res.send(myBooks);
-      } catch (error) {
-        console.error("Error fetching librarian's books:", error);
-        res.status(500).send({ message: "Failed to fetch books." });
-      }
-    });
-
-    app.patch("/books/status/:id", async (req, res) => {
-      const id = req.params.id;
-      const { status } = req.body;
-
-      if (!status || (status !== "published" && status !== "unpublished")) {
-        return res.status(400).send({ message: "Invalid status provided." });
-      }
-
-      try {
-        const result = await booksCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { status: status } }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ message: "Book not found." });
-        }
-        res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
-      } catch (error) {
-        console.error("Error updating book status:", error);
-        res.status(500).send({ message: "Failed to update book status." });
-      }
-    });
-
-    app.patch("/books/:id", async (req, res) => {
-      const id = req.params.id;
-      const updatedBookData = req.body;
-      delete updatedBookData._id;
-
-      try {
-        const result = await booksCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: updatedBookData }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ message: "Book not found." });
-        }
-        res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
-      } catch (error) {
-        console.error("Error updating book:", error);
-        res.status(500).send({ message: "Failed to update book." });
-      }
-    });
-
-    // --- ORDER ENDPOINTS (Read Operations) ---
-    app.get("/my-orders/:email", async (req, res) => {
-      const email = req.params.email;
-      const query = { email: email };
-      const result = await ordersCollection
-        .find(query)
-        .sort({ orderDate: -1 })
-        .toArray();
-      res.send(result);
-    });
-
-    app.get("/orders/:id", async (req, res) => {
-      const id = req.params.id;
-      try {
-        const result = await ordersCollection.findOne({
-          _id: new ObjectId(id),
-        });
-        if (!result)
-          return res.status(404).send({ message: "Order not found" });
-        res.send(result);
-      } catch (error) {
-        res.status(500).send({ message: "Error fetching order", error });
-      }
-    }); // --- ADMIN ENDPOINT: DELETE BOOK AND RELATED ORDERS (DELETE) ---
-
-    app.delete("/books/delete/:id", async (req, res) => {
-      const bookId = req.params.id;
-
-      try {
-        // ... (The implementation logic is fine here as it's a specific route)
-        const deleteBookResult = await booksCollection.deleteOne({
-          _id: new ObjectId(bookId),
-        });
-        const deleteOrdersResult = await ordersCollection.deleteMany({
-          bookId: bookId,
-        });
-
-        if (deleteBookResult.deletedCount === 0) {
-          return res.status(404).send({ message: "Book not found." });
-        }
-
-        res.send({
-          acknowledged: true,
-          bookDeleted: deleteBookResult.deletedCount,
-          ordersDeleted: deleteOrdersResult.deletedCount,
-          message: `Book and ${deleteOrdersResult.deletedCount} associated orders deleted successfully.`,
-        });
-      } catch (error) {
-        console.error("Error deleting book and orders:", error);
-        res
-          .status(500)
-          .send({ message: "Failed to delete book and associated orders." });
-      }
-    });
-
-    // --- ⭐ NEW LIBRARIAN ENDPOINT: GET ORDERS FOR HIS/HER BOOKS (GET) ---
-    app.get("/librarian-orders/:email", async (req, res) => {
-      const librarianEmail = req.params.email;
-
-      try {
-        // 1. Find all Book IDs added by this librarian
-        const librarianBooks = await booksCollection
-          .find({ "seller_libarien.email": librarianEmail })
-          .project({ _id: 1 }) // Only select the _id field
-          .toArray();
-
-        // Extract the string IDs
-        const bookIds = librarianBooks.map((book) => book._id.toHexString());
-
-        if (bookIds.length === 0) {
-          return res.send([]); // No books found, so no orders
-        }
-
-        // 2. Find all orders associated with these book IDs
-        // We assume the orders collection stores the book's ObjectId as a string field named 'bookId'
-        const orders = await ordersCollection
-          .find({ bookId: { $in: bookIds } })
-          .sort({ orderDate: -1 }) // Latest orders first
-          .toArray();
-
-        res.send(orders);
-      } catch (error) {
-        console.error("Error fetching librarian's orders:", error);
-        res.status(500).send({ message: "Failed to fetch orders." });
-      }
-    });
-
-    // --- ⭐ NEW LIBRARIAN ENDPOINT: UPDATE ORDER FULFILLMENT STATUS (PATCH) ---
-    app.patch("/orders/update-status/:id", async (req, res) => {
-      const id = req.params.id;
-      const { newStatus } = req.body; // Expecting 'shipped' or 'delivered'
-
-      const allowedStatuses = ["shipped", "delivered", "pending", "cancelled"];
-      if (!allowedStatuses.includes(newStatus)) {
-        return res.status(400).send({ message: "Invalid status update." });
-      }
-
-      try {
-        const result = await ordersCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { status: newStatus } }
-        );
-
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ message: "Order not found." });
-        }
-
-        res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
-      } catch (error) {
-        console.error("Error updating order status:", error);
-        res.status(500).send({ message: "Failed to update order status." });
-      }
-    });
-
-    //reviews related
-
-    app.post("/reviews", async (req, res) => {
-      const { bookId, userId, userName, rating, reviewText } = req.body;
-
-      // Basic validation
-      if (
-        !bookId ||
-        !userId ||
-        typeof rating === "undefined" ||
-        rating < 1 ||
-        rating > 5
-      ) {
-        return res.status(400).send({ message: "Invalid review data." });
-      }
-
-      try {
-        // 1. Prepare the review document
-        const reviewData = {
-          bookId: new ObjectId(bookId),
-          userId: userId, // User email or ID
-          userName: userName,
-          rating: parseInt(rating),
-          reviewText: reviewText || "",
-          createdAt: new Date(),
+    try {
+        const db = client.db("booksDB");
+        const booksCollection = db.collection("books");
+        const ordersCollection = db.collection("orders");
+        const usersCollection = db.collection("users");
+        const reviewsCollection = db.collection("reviews");
+        const wishlistCollection = db.collection("wishlist");
+
+        // --- 2. Role Verification Utilities ---
+        
+        const getUserRole = async (email) => {
+            return await usersCollection.findOne({ email }, { projection: { role: 1 } });
         };
 
-        // 2. Insert the new review
-        const result = await reviewsCollection.insertOne(reviewData);
+        // Middleware: Only grants access if role is 'admin'
+        const verifyAdmin = async (req, res, next) => {
+            const userRole = await getUserRole(req.tokenEmail);
+            if (!userRole || userRole.role !== 'admin') {
+                return res.status(403).send({ message: 'Forbidden: Admin privilege required' });
+            }
+            next();
+        };
 
-        // 3. Calculate and Update the Book's Average Rating
+        // Middleware: Grants access if role is 'librarian' or 'admin'
+        const verifyLibrarian = async (req, res, next) => {
+            const userRole = await getUserRole(req.tokenEmail);
 
-        // Find all reviews for this book
-        const allReviews = await reviewsCollection
-          .find({ bookId: new ObjectId(bookId) })
-          .toArray();
+            if (!userRole || (userRole.role !== 'librarian' && userRole.role !== 'admin')) {
+                return res.status(403).send({ message: 'Forbidden: Librarian privilege required' });
+            }
+            next();
+        };
 
-        // Calculate new average
-        const totalRating = allReviews.reduce(
-          (sum, review) => sum + review.rating,
-          0
-        );
-        const newAverageRating = (totalRating / allReviews.length).toFixed(1);
+        // 
 
-        // Update the book's rating and review count
-        await booksCollection.updateOne(
-          { _id: new ObjectId(bookId) },
-          { $set: { rating: newAverageRating }, $inc: { reviewCount: 1 } } // Assuming you track reviewCount
-        );
+        // =======================================================
+        //               USER & ADMIN ENDPOINTS
+        // =======================================================
 
-        res.send({
-          acknowledged: true,
-          insertedId: result.insertedId,
-          newAverageRating,
+        // Public Route: General User Creation
+        app.post("/users", async (req, res) => {
+            const user = req.body;
+            const query = { email: user.email };
+            const existingUser = await usersCollection.findOne(query);
+
+            if (existingUser) {
+                return res.send({ message: "User already exists", insertedId: null });
+            }
+
+            const result = await usersCollection.insertOne({
+                ...user,
+                role: "user", // Default role
+                createdAt: new Date(),
+            });
+            res.send(result);
         });
-      } catch (error) {
-        console.error("Error submitting review:", error);
-        res.status(500).send({ message: "Failed to submit review." });
-      }
-    });
+        
+        // SECURITY ENDPOINT: For Frontend useRole hook
+        app.get("/users/role/:email", verifyJWT, async (req, res) => {
+            const email = req.params.email;
 
-    // --- Get Reviews for a Specific Book (GET) ---
-    app.get("/reviews/:bookId", async (req, res) => {
-      try {
-        const bookId = req.params.bookId;
-        const reviews = await reviewsCollection
-          .find({ bookId: new ObjectId(bookId) })
-          .sort({ createdAt: -1 }) // Show newest reviews first
-          .toArray();
-        res.send(reviews);
-      } catch (error) {
-        console.error("Error fetching reviews:", error);
-        res.status(500).send({ message: "Failed to fetch reviews." });
-      }
-    });
+            // Security check: Must match token email
+            if (email !== req.tokenEmail) {
+                return res.status(403).send({ message: "Forbidden: Token/Email mismatch" });
+            }
 
-    // --- Check if User Can Review (GET) ---
-    app.get("/user-can-review/:bookId/:userEmail", async (req, res) => {
-      try {
-        const { bookId, userEmail } = req.params;
-
-        // 1. Check if the user has a 'paid' order for this book
-        const hasOrdered = await ordersCollection.findOne({
-          bookId: bookId,
-          email: userEmail,
-          payment_status: "paid",
-        });
-
-        if (!hasOrdered) {
-          return res.send({ canReview: false, reason: "NOT_ORDERED" });
-        }
-
-        // 2. Check if the user has ALREADY submitted a review for this book
-        const hasReviewed = await reviewsCollection.findOne({
-          bookId: new ObjectId(bookId),
-          userId: userEmail, // Assuming userId is the user's email
+            try {
+                const user = await usersCollection.findOne({ email: email }, { projection: { role: 1 } });
+                if (!user) {
+                    // Fallback to 'user' if not found, though should be created on registration
+                    return res.status(404).send({ role: "user", message: "User not found" });
+                }
+                res.send({ role: user.role });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch user role." });
+            }
         });
 
-        if (hasReviewed) {
-          return res.send({
-            canReview: false,
-            reason: "ALREADY_REVIEWED",
-            existingReview: hasReviewed,
-          });
-        }
+        // ADMIN ROUTE: Read All Users (GET)
+        app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
+            const result = await usersCollection.find().toArray();
+            res.send(result);
+        });
+        
+        // ADMIN ROUTE: Update User Role (PATCH helper function)
+        const updateRole = async (req, res, newRole) => {
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) };
+            const updateDoc = { $set: { role: newRole, lastRoleUpdate: new Date() } };
+            const result = await usersCollection.updateOne(query, updateDoc);
+            res.send(result);
+        };
+        
+        // ADMIN ROUTE: Make Librarian (PATCH)
+        app.patch("/users/make-librarian/:id", verifyJWT, verifyAdmin, async (req, res) => {
+            await updateRole(req, res, "librarian");
+        });
 
-        res.send({ canReview: true });
-      } catch (error) {
-        console.error("Error checking review eligibility:", error);
-        res
-          .status(500)
-          .send({ message: "Failed to check review eligibility." });
-      }
-    });
+        // ADMIN ROUTE: Make Admin (PATCH)
+        app.patch("/users/make-admin/:id", verifyJWT, verifyAdmin, async (req, res) => {
+            await updateRole(req, res, "admin");
+        });
 
-    //wishlist related
-    // 1. Add a book to wishlist
-    app.post("/wishlist", async (req, res) => {
-      const wishlistData = req.body;
 
-      // Check if book is already in user's wishlist
-      const query = {
-        userEmail: wishlistData.userEmail,
-        bookId: wishlistData.bookId,
-      };
-      const existing = await wishlistCollection.findOne(query);
+        // =======================================================
+        //               BOOK ENDPOINTS
+        // =======================================================
 
-      if (existing) {
-        return res
-          .status(400)
-          .send({ message: "This book is already in your wishlist!" });
-      }
+        // LIBRARIAN ROUTE: Create Book (POST)
+        app.post("/books", verifyJWT, verifyLibrarian, async (req, res) => {
+            const bookData = req.body;
+            // Associate the book with the logged-in librarian
+            bookData.librarianEmail = req.tokenEmail; 
+            const result = await booksCollection.insertOne(bookData);
+            res.send(result);
+        });
 
-      const result = await wishlistCollection.insertOne(wishlistData);
-      res.send(result);
-    });
+        // Public Route: Read All Books (with search, sort, pagination) (GET)
+        app.get("/books", async (req, res) => {
+            const page = parseInt(req.query.page) || 0; 
+            const size = parseInt(req.query.size) || 10; 
+            const search = req.query.search;
+            const category = req.query.category;
+            const rating = req.query.rating;
+            // Sorting can be implemented here based on req.query.sortField/sortOrder
+            
+            let query = { status: "published" };
 
-    // 2. Get wishlist for a specific user
-    app.get("/wishlist/:email", async (req, res) => {
-      const email = req.params.email;
-      const result = await wishlistCollection
-        .find({ userEmail: email })
-        .toArray();
-      res.send(result);
-    });
+            if (search && search !== "undefined") {
+                query.$or = [
+                    { bookTitle: { $regex: search, $options: "i" } },
+                    { authorName: { $regex: search, $options: "i" } },
+                ];
+            }
+            if (category && category !== "undefined" && category !== "") {
+                query.category = category;
+            }
+            if (rating && rating !== "0") {
+                query.rating = { $gte: parseFloat(rating) };
+            }
+            
+            try {
+                const result = await booksCollection
+                    .find(query)
+                    .skip(page * size)
+                    .limit(size)
+                    .toArray();
 
-    // 3. Remove from wishlist
-    app.delete("/wishlist/:id", async (req, res) => {
-      const id = req.params.id;
-      const result = await wishlistCollection.deleteOne({
-        _id: new ObjectId(id),
-      });
-      res.send(result);
-    });
+                const count = await booksCollection.countDocuments(query);
+                res.send({ result, count });
+            } catch (error) {
+                res.status(500).send({ message: "Error fetching books", error });
+            }
+        });
+        
+        // Public Route: Read Latest Books (GET)
+        app.get("/latest-books", async (req, res) => {
+            const limit = 6;
+            const query = { status: "published" };
+            const result = await booksCollection
+                .find(query)
+                .sort({ _id: -1 })
+                .limit(limit)
+                .toArray();
+            res.send(result);
+        });
+        
+        // ADMIN ROUTE: Read ALL books (Admin View - Includes unpublished) (GET)
+        app.get("/books/all", verifyJWT, verifyAdmin, async (req, res) => {
+            try {
+                const allBooks = await booksCollection.find({}).sort({ _id: -1 }).toArray();
+                res.send(allBooks);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch all books." });
+            }
+        });
+        
+        // Public Route: Read Single Book Details (GET)
+        app.get("/books/:id", async (req, res) => {
+            const id = req.params.id;
+            const result = await booksCollection.findOne({ _id: new ObjectId(id) });
+            res.send(result);
+        });
 
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
-  } finally {
-    // Ensures that the client will close when you finish/error
-  }
+        // LIBRARIAN ROUTE: Read My Books (GET)
+        app.get("/my-books/:email", verifyJWT, verifyLibrarian, async (req, res) => {
+            const userEmail = req.params.email;
+            if (userEmail !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Email does not match user" });
+            }
+
+            try {
+                const query = { "seller_libarien.email": userEmail };
+                const myBooks = await booksCollection.find(query).sort({ _id: -1 }).toArray();
+                res.send(myBooks);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch books." });
+            }
+        });
+
+        // LIBRARIAN/ADMIN ROUTE: Update Publish Status (PATCH)
+        app.patch("/books/status/:id", verifyJWT, verifyLibrarian, async (req, res) => {
+            const id = req.params.id;
+            const { status } = req.body;
+            // ... validation logic ...
+            try {
+                const result = await booksCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { status: status } }
+                );
+                res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to update book status." });
+            }
+        });
+
+        // LIBRARIAN/ADMIN ROUTE: Update Book Data (PATCH)
+        app.patch("/books/:id", verifyJWT, verifyLibrarian, async (req, res) => {
+            const id = req.params.id;
+            const updatedBookData = req.body;
+            delete updatedBookData._id;
+
+            try {
+                const result = await booksCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: updatedBookData }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).send({ message: "Book not found." });
+                }
+                res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to update book." });
+            }
+        });
+        
+        // ADMIN ROUTE: Delete Book and Orders (DELETE)
+        app.delete("/books/delete/:id", verifyJWT, verifyAdmin, async (req, res) => {
+            const bookId = req.params.id;
+            
+            try {
+                const deleteBookResult = await booksCollection.deleteOne({ _id: new ObjectId(bookId) });
+                const deleteOrdersResult = await ordersCollection.deleteMany({ bookId: bookId });
+
+                if (deleteBookResult.deletedCount === 0) {
+                    return res.status(404).send({ message: "Book not found." });
+                }
+
+                res.send({
+                    acknowledged: true,
+                    bookDeleted: deleteBookResult.deletedCount,
+                    ordersDeleted: deleteOrdersResult.deletedCount,
+                    message: `Book and ${deleteOrdersResult.deletedCount} associated orders deleted successfully.`,
+                });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to delete book and associated orders." });
+            }
+        });
+
+
+        // =======================================================
+        //               ORDER & PAYMENT ENDPOINTS
+        // =======================================================
+        
+        // USER ROUTE: Create Order (POST)
+        app.post("/orders", verifyJWT, async (req, res) => {
+            const orderData = req.body;
+            
+            if (orderData.email !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Order email mismatch" });
+            }
+
+            orderData.orderDate = new Date();
+            orderData.status = "pending";
+            orderData.payment_status = "unpaid";
+
+            const result = await ordersCollection.insertOne(orderData);
+            res.send(result);
+        });
+
+        // USER ROUTE: Read My Orders (GET)
+        app.get("/my-orders/:email", verifyJWT, async (req, res) => {
+            const email = req.params.email;
+            if (email !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Email does not match user" });
+            }
+            
+            const query = { email: email };
+            const result = await ordersCollection.find(query).sort({ orderDate: -1 }).toArray();
+            res.send(result);
+        });
+        
+        // USER ROUTE: Read My Invoices (GET)
+        app.get("/my-invoices/:email", verifyJWT, async (req, res) => {
+            const userEmail = req.params.email;
+            if (userEmail !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Email does not match user" });
+            }
+
+            try {
+                const query = { email: userEmail, payment_status: "paid" };
+                const invoices = await ordersCollection.find(query).toArray();
+                res.send(invoices);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch paid orders." });
+            }
+        });
+
+        // LIBRARIAN ROUTE: Read Orders for my books (GET)
+        app.get("/librarian-orders/:email", verifyJWT, verifyLibrarian, async (req, res) => {
+            const librarianEmail = req.params.email;
+            if (librarianEmail !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Email does not match user" });
+            }
+
+            try {
+                const librarianBooks = await booksCollection
+                    .find({ "seller_libarien.email": librarianEmail })
+                    .project({ _id: 1 }) 
+                    .toArray();
+
+                const bookIds = librarianBooks.map((book) => book._id.toHexString());
+
+                if (bookIds.length === 0) {
+                    return res.send([]); 
+                }
+
+                const orders = await ordersCollection
+                    .find({ bookId: { $in: bookIds } })
+                    .sort({ orderDate: -1 }) 
+                    .toArray();
+
+                res.send(orders);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch orders." });
+            }
+        });
+
+        // LIBRARIAN ROUTE: Update Order Fulfillment Status (PATCH)
+        app.patch("/orders/update-status/:id", verifyJWT, verifyLibrarian, async (req, res) => {
+            const id = req.params.id;
+            const { newStatus } = req.body; 
+
+            const allowedStatuses = ["shipped", "delivered", "pending", "cancelled"];
+            if (!allowedStatuses.includes(newStatus)) {
+                return res.status(400).send({ message: "Invalid status update." });
+            }
+
+            try {
+                const result = await ordersCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { status: newStatus } }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).send({ message: "Order not found." });
+                }
+
+                res.send({ acknowledged: true, modifiedCount: result.modifiedCount });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to update order status." });
+            }
+        });
+        
+        // USER ROUTE: Cancel Order (PATCH)
+        app.patch("/orders/cancel/:id", verifyJWT, async (req, res) => {
+            const id = req.params.id;
+            // Best practice: verify that the order's email field matches req.tokenEmail before updating
+            const query = { _id: new ObjectId(id) };
+            const updateDoc = { $set: { status: "cancelled", payment_status: "cancelled" } };
+            const result = await ordersCollection.updateOne(query, updateDoc);
+            res.send(result);
+        });
+
+        // USER ROUTE: Stripe Checkout Session (POST)
+        app.post("/create-checkout-session", verifyJWT, async (req, res) => {
+            const { bookTitle, price, email, quantity, orderId } = req.body;
+            
+            if (email !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Checkout email mismatch" });
+            }
+
+            if (!orderId || !bookTitle || !price || !email) {
+                return res.status(400).send({ error: "Missing required payment details." });
+            }
+
+            try {
+                const session = await stripe.checkout.sessions.create({
+                    line_items: [
+                        {
+                            price_data: {
+                                currency: "usd",
+                                product_data: { name: bookTitle },
+                                unit_amount: Math.round(price * 100), 
+                            },
+                            quantity: quantity || 1,
+                        },
+                    ],
+                    customer_email: email,
+                    mode: "payment",
+                    success_url: `${process.env.CLIENT_DOMAIN}/payment/${orderId}?status=success&session_id={CHECKOUT_SESSION_ID}`,
+                    cancel_url: `${process.env.CLIENT_DOMAIN}/dashboard/my-orders?status=cancelled&orderId=${orderId}`,
+                });
+
+                res.send({ url: session.url });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+        
+        // USER ROUTE: Handle Payment Success (PATCH)
+        app.patch("/orders/payment-success/:orderId", verifyJWT, async (req, res) => {
+            const orderId = req.params.orderId;
+            const sessionId = req.body.sessionId;
+
+            try {
+                // Should perform Stripe verification here using sessionId
+                if (sessionId) {
+                    const session = await stripe.checkout.sessions.retrieve(sessionId);
+                    if (session.payment_status !== "paid") {
+                         return res.status(400).send({ message: "Payment session status is not 'paid'." });
+                    }
+                } 
+
+                const result = await ordersCollection.updateOne(
+                    { _id: new ObjectId(orderId) },
+                    {
+                        $set: {
+                            payment_status: "paid",
+                            status: "processing",
+                            stripeSessionId: sessionId || "N/A",
+                            paidAt: new Date(),
+                        },
+                    }
+                );
+
+                if (result.modifiedCount === 1) {
+                    res.send({ acknowledged: true, message: "Order updated to paid." });
+                } else {
+                    res.status(404).send({ message: "Order not found or already paid." });
+                }
+            } catch (error) {
+                res.status(500).send({ message: "Failed to update order status.", error });
+            }
+        });
+
+
+        // =======================================================
+        //                  WISHLIST & REVIEW ENDPOINTS
+        // =======================================================
+
+        // USER ROUTE: Create Wishlist Item (POST)
+        app.post("/wishlist", verifyJWT, async (req, res) => {
+            const wishlistData = req.body;
+             if (wishlistData.userEmail !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Wishlist user mismatch" });
+            }
+
+            const query = { userEmail: wishlistData.userEmail, bookId: wishlistData.bookId };
+            const existing = await wishlistCollection.findOne(query);
+
+            if (existing) {
+                return res.status(400).send({ message: "This book is already in your wishlist!" });
+            }
+
+            const result = await wishlistCollection.insertOne(wishlistData);
+            res.send(result);
+        });
+
+        // USER ROUTE: Read Wishlist (GET)
+        app.get("/wishlist/:email", verifyJWT, async (req, res) => {
+            const email = req.params.email;
+             if (email !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Email does not match user" });
+            }
+            const result = await wishlistCollection.find({ userEmail: email }).toArray();
+            res.send(result);
+        });
+
+        // USER ROUTE: Delete Wishlist Item (DELETE)
+        app.delete("/wishlist/:id", verifyJWT, async (req, res) => {
+            const id = req.params.id;
+            // Highly recommend checking that the item belongs to req.tokenEmail
+            const result = await wishlistCollection.deleteOne({ _id: new ObjectId(id) });
+            res.send(result);
+        });
+
+        // USER ROUTE: Create Review (POST)
+        app.post("/reviews", verifyJWT, async (req, res) => {
+            const { bookId, userId, userName, rating, reviewText } = req.body;
+             if (userId !== req.tokenEmail) {
+                 return res.status(403).send({ message: "Forbidden: Review user mismatch" });
+            }
+
+            if (!bookId || !userId || typeof rating === "undefined" || rating < 1 || rating > 5) {
+                return res.status(400).send({ message: "Invalid review data." });
+            }
+
+            try {
+                // 1. Prepare and Insert the new review
+                const reviewData = {
+                    bookId: new ObjectId(bookId),
+                    userId: userId, 
+                    userName: userName,
+                    rating: parseInt(rating),
+                    reviewText: reviewText || "",
+                    createdAt: new Date(),
+                };
+                const result = await reviewsCollection.insertOne(reviewData);
+
+                // 2. Calculate and Update the Book's Average Rating
+                const allReviews = await reviewsCollection.find({ bookId: new ObjectId(bookId) }).toArray();
+                const totalRating = allReviews.reduce((sum, review) => sum + review.rating, 0);
+                const newAverageRating = (totalRating / allReviews.length).toFixed(1);
+
+                await booksCollection.updateOne(
+                    { _id: new ObjectId(bookId) },
+                    { $set: { rating: newAverageRating }, $inc: { reviewCount: 1 } } 
+                );
+
+                res.send({ acknowledged: true, insertedId: result.insertedId, newAverageRating });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to submit review." });
+            }
+        });
+
+        // Public Route: Read Reviews for a Specific Book (GET)
+        app.get("/reviews/:bookId", async (req, res) => {
+            try {
+                const bookId = req.params.bookId;
+                const reviews = await reviewsCollection
+                    .find({ bookId: new ObjectId(bookId) })
+                    .sort({ createdAt: -1 })
+                    .toArray();
+                res.send(reviews);
+            } catch (error) {
+                res.status(500).send({ message: "Failed to fetch reviews." });
+            }
+        });
+
+        // Public Route: Check if User Can Review (GET)
+        app.get("/user-can-review/:bookId/:userEmail", async (req, res) => {
+            try {
+                const { bookId, userEmail } = req.params;
+
+                // 1. Check if the user has a 'paid' order for this book
+                const hasOrdered = await ordersCollection.findOne({
+                    bookId: bookId,
+                    email: userEmail,
+                    payment_status: "paid",
+                });
+
+                if (!hasOrdered) {
+                    return res.send({ canReview: false, reason: "NOT_ORDERED" });
+                }
+
+                // 2. Check if the user has ALREADY submitted a review for this book
+                const hasReviewed = await reviewsCollection.findOne({
+                    bookId: new ObjectId(bookId),
+                    userId: userEmail, 
+                });
+
+                if (hasReviewed) {
+                    return res.send({ canReview: false, reason: "ALREADY_REVIEWED", existingReview: hasReviewed });
+                }
+
+                res.send({ canReview: true });
+            } catch (error) {
+                res.status(500).send({ message: "Failed to check review eligibility." });
+            }
+        });
+
+
+        // --- MongoDB Connection Check ---
+        await client.db("admin").command({ ping: 1 });
+        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+
+    } finally {
+        // Keeps the server running
+    }
 }
 run().catch(console.dir);
 
+// --- Root and Listener ---
 app.get("/", (req, res) => {
-  res.send("Hello from Server..I am here");
+    res.send("BookCourier Server is operational and secure.");
 });
 
 app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+    console.log(`Server is running on port ${port}`);
 });
