@@ -17,15 +17,45 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// middleware
-app.use(express.json());
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://your-frontend.vercel.app",
+  "https://your-frontend.netlify.app",
+  "https://book-parcel.web.app"
+];
+
 app.use(
   cors({
-    origin: [process.env.CLIENT_DOMAIN],
+    origin: function (origin, callback) {
+      // allow requests with no origin (like mobile apps, curl)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     credentials: true,
-    optionSuccessStatus: 200,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
+
+// middleware
+app.use(express.json());
+// app.use(
+//   cors({
+//     origin: [process.env.CLIENT_DOMAIN],
+//     credentials: true,
+//     optionSuccessStatus: 200,
+//   })
+// );
+
+
+
 
 // jwt
 const verifyJWT = async (req, res, next) => {
@@ -55,6 +85,7 @@ const client = new MongoClient(process.env.MONGODB_URL, {
     deprecationErrors: true,
   },
 });
+
 
 async function run() {
   try {
