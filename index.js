@@ -8,8 +8,7 @@ const port = process.env.PORT || 3000;
 
 const app = express();
 
-// --- Firebase Admin Initialization ---
-// WARNING: Ensure FB_SERVICE_KEY is securely stored in your environment variables.
+// firebase admin
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
   "utf-8"
 );
@@ -18,19 +17,17 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// --- Middleware ---
+// middleware
 app.use(express.json());
 app.use(
   cors({
-    // Ensure this points to your specific frontend URL for security
     origin: [process.env.CLIENT_DOMAIN],
     credentials: true,
     optionSuccessStatus: 200,
   })
 );
 
-// --- 1. JWT Verification Middleware ---
-// Verifies the Firebase ID Token sent from the client
+// jwt
 const verifyJWT = async (req, res, next) => {
   const token = req?.headers?.authorization?.split(" ")[1];
 
@@ -40,11 +37,10 @@ const verifyJWT = async (req, res, next) => {
       .send({ message: "Unauthorized Access: Token Missing" });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(token); // CRITICAL: Attach the verified user email to the request object
+    const decoded = await admin.auth().verifyIdToken(token);
     req.tokenEmail = decoded.email;
     next();
   } catch (err) {
-    // Token expired, invalid, etc.
     console.error("JWT Verification Error:", err.code);
     return res
       .status(401)
@@ -52,7 +48,6 @@ const verifyJWT = async (req, res, next) => {
   }
 };
 
-// MongoDB Client Setup
 const client = new MongoClient(process.env.MONGODB_URL, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -68,17 +63,17 @@ async function run() {
     const ordersCollection = db.collection("orders");
     const usersCollection = db.collection("users");
     const reviewsCollection = db.collection("reviews");
-    const wishlistCollection = db.collection("wishlist"); // --- 2. Role Verification Utilities ---
+    const wishlistCollection = db.collection("wishlist");
 
     const getUserRole = async (email) => {
       return await usersCollection.findOne(
         { email },
         { projection: { role: 1 } }
       );
-    }; // Middleware: Only grants access if role is 'admin'
+    };
 
     const verifyAdmin = async (req, res, next) => {
-      const userRole = await getUserRole(req.tokenEmail); // IMPORTANT: Attach the user's actual role to the request for use in route handlers
+      const userRole = await getUserRole(req.tokenEmail);
       req.userRole = userRole?.role;
       if (!userRole || userRole.role !== "admin") {
         return res
@@ -86,10 +81,10 @@ async function run() {
           .send({ message: "Forbidden: Admin privilege required" });
       }
       next();
-    }; // Middleware: Grants access if role is 'librarian' or 'admin'
+    };
 
     const verifyLibrarian = async (req, res, next) => {
-      const userRole = await getUserRole(req.tokenEmail); // IMPORTANT: Attach the user's actual role to the request for use in route handlers
+      const userRole = await getUserRole(req.tokenEmail);
       req.userRole = userRole?.role;
 
       if (
@@ -101,12 +96,11 @@ async function run() {
           .send({ message: "Forbidden: Librarian privilege required" });
       }
       next();
-    }; // // ======================================================= //               USER & ADMIN ENDPOINTS // ======================================================= // (User creation route commented out - assuming handled elsewhere) // app.post("/users", async (req, res) => { ... });
+    };
 
     app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
       try {
-        // A blank query object {} retrieves ALL documents in the collection
-        const query = {}; // Use a projection to only send necessary fields (good practice)
+        const query = {};
 
         const projection = { password: 0 }; // Exclude the password/sensitive fields
 
@@ -118,7 +112,7 @@ async function run() {
         console.error("Error fetching all users:", error);
         res.status(500).send({ message: "Failed to retrieve user list." });
       }
-    }); // SECURITY ENDPOINT: For Frontend useRole hook
+    });
 
     app.get("/users/role/:email", verifyJWT, async (req, res) => {
       const email = req.params.email; // Security check: Must match token email
@@ -135,7 +129,6 @@ async function run() {
           { projection: { role: 1 } }
         );
         if (!user) {
-          // Fallback to 'user' if not found, though should be created on registration
           return res
             .status(404)
             .send({ role: "user", message: "User not found" });
@@ -144,12 +137,12 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to fetch user role." });
       }
-    }); // ADMIN ROUTE: Read All Users (GET) // NOTE: This is a duplicate of the first '/users' route, keeping for completeness
+    });
 
     app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
       const result = await usersCollection.find().toArray();
       res.send(result);
-    }); // ADMIN ROUTE: Update User Role (PATCH helper function)
+    });
 
     const updateRole = async (req, res, newRole) => {
       const id = req.params.id;
@@ -157,8 +150,7 @@ async function run() {
       const updateDoc = { $set: { role: newRole, lastRoleUpdate: new Date() } };
       const result = await usersCollection.updateOne(query, updateDoc);
       res.send(result);
-    }; // ADMIN ROUTE: Make Librarian (PATCH)
-
+    };
     app.patch(
       "/users/make-librarian/:id",
       verifyJWT,
@@ -166,7 +158,7 @@ async function run() {
       async (req, res) => {
         await updateRole(req, res, "librarian");
       }
-    ); // ADMIN ROUTE: Make Admin (PATCH)
+    );
 
     app.patch(
       "/users/make-admin/:id",
@@ -175,21 +167,20 @@ async function run() {
       async (req, res) => {
         await updateRole(req, res, "admin");
       }
-    ); // ======================================================= //               BOOK ENDPOINTS // ======================================================= // LIBRARIAN ROUTE: Create Book (POST)
+    );
 
     app.post("/books", verifyJWT, verifyLibrarian, async (req, res) => {
-      const bookData = req.body; // Associate the book with the logged-in librarian
+      const bookData = req.body;
       bookData.librarianEmail = req.tokenEmail;
       const result = await booksCollection.insertOne(bookData);
       res.send(result);
-    }); // Public Route: Read All Books (with search, sort, pagination) (GET)
-
+    });
     app.get("/books", async (req, res) => {
       const page = parseInt(req.query.page) || 0;
       const size = parseInt(req.query.size) || 10;
       const search = req.query.search;
       const category = req.query.category;
-      const rating = req.query.rating; // Sorting can be implemented here based on req.query.sortField/sortOrder
+      const rating = req.query.rating;
       let query = { status: "published" };
 
       if (search && search !== "undefined") {
@@ -217,8 +208,7 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Error fetching books", error });
       }
-    }); // Public Route: Read Latest Books (GET)
-
+    });
     app.get("/latest-books", async (req, res) => {
       const limit = 6;
       const query = { status: "published" };
@@ -228,7 +218,7 @@ async function run() {
         .limit(limit)
         .toArray();
       res.send(result);
-    }); // ADMIN ROUTE: Read ALL books (Admin View - Includes unpublished) (GET)
+    });
 
     app.get("/books/all", verifyJWT, verifyAdmin, async (req, res) => {
       try {
@@ -240,20 +230,20 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to fetch all books." });
       }
-    }); // Public Route: Read Single Book Details (GET)
+    });
 
     app.get("/books/:id", async (req, res) => {
       const id = req.params.id;
       const result = await booksCollection.findOne({ _id: new ObjectId(id) });
       res.send(result);
-    }); // LIBRARIAN ROUTE: Read My Books (GET)
+    });
 
     app.get(
       "/my-books/:email",
       verifyJWT,
       verifyLibrarian,
       async (req, res) => {
-        const userEmail = req.params.email; // Security check against URL param
+        const userEmail = req.params.email;
         if (userEmail !== req.tokenEmail) {
           return res
             .status(403)
@@ -271,15 +261,14 @@ async function run() {
           res.status(500).send({ message: "Failed to fetch books." });
         }
       }
-    ); // LIBRARIAN/ADMIN ROUTE: Update Publish Status (PATCH)
-
+    );
     app.patch(
       "/books/status/:id",
       verifyJWT,
       verifyLibrarian,
       async (req, res) => {
         const id = req.params.id;
-        const { status } = req.body; // ... validation logic ...
+        const { status } = req.body;
         try {
           const result = await booksCollection.updateOne(
             { _id: new ObjectId(id) },
@@ -290,7 +279,7 @@ async function run() {
           res.status(500).send({ message: "Failed to update book status." });
         }
       }
-    ); // LIBRARIAN/ADMIN ROUTE: Update Book Data (PATCH)
+    );
 
     app.patch("/books/:id", verifyJWT, verifyLibrarian, async (req, res) => {
       const id = req.params.id;
@@ -310,7 +299,7 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to update book." });
       }
-    }); // ADMIN ROUTE: Delete Book and Orders (DELETE)
+    });
 
     app.delete(
       "/books/delete/:id",
@@ -343,7 +332,7 @@ async function run() {
             .send({ message: "Failed to delete book and associated orders." });
         }
       }
-    ); // ======================================================= //               ORDER & PAYMENT ENDPOINTS // ======================================================= // USER ROUTE: Create Order (POST)
+    );
 
     app.post("/orders", verifyJWT, async (req, res) => {
       const orderData = req.body;
@@ -362,9 +351,7 @@ async function run() {
       res.send(result);
     });
 
-    // -----------------------------------------------------------------
-    // ⭐ ADMIN/LIBRARIAN ROUTE: Read All/Filtered Orders (The Fix for 404)
-    // -----------------------------------------------------------------
+    //   Admin route
     app.get("/orders", verifyJWT, verifyLibrarian, async (req, res) => {
       const userEmail = req.tokenEmail;
       const userRole = req.userRole; // Role attached by verifyLibrarian middleware
@@ -378,9 +365,6 @@ async function run() {
             .toArray();
           return res.send(allOrders);
         } else if (userRole === "librarian") {
-          // Librarian: Fetch orders related to their books (reusing librarian-orders logic).
-
-          // 1. Find all Book IDs managed by this librarian
           const librarianBooks = await booksCollection
             .find({ "seller_libarien.email": userEmail })
             .project({ _id: 1 }) // Only need the ID
@@ -392,7 +376,6 @@ async function run() {
             return res.send([]);
           }
 
-          // 2. Find orders associated with those Book IDs
           const orders = await ordersCollection
             .find({ bookId: { $in: bookIds } })
             .sort({ orderDate: -1 })
@@ -400,7 +383,6 @@ async function run() {
 
           return res.send(orders);
         } else {
-          // Should be caught by verifyLibrarian, but safe to include.
           return res
             .status(403)
             .send({ message: "Forbidden: Role not authorized." });
@@ -409,8 +391,7 @@ async function run() {
         console.error("Error fetching orders:", error);
         res.status(500).send({ message: "Failed to retrieve orders." });
       }
-    }); // 💡 FIX: USER ROUTE: Read Single Order Details (GET) // Required by the PaymentPage to display book title/price
-    // NOTE: The previous, less secure app.get("/librarian-orders/:email", ...) is now obsolete and removed below.
+    });
 
     app.get("/orders/:orderId", verifyJWT, async (req, res) => {
       const orderId = req.params.orderId;
@@ -421,28 +402,24 @@ async function run() {
 
         if (!order) {
           return res.status(404).send({ message: "Order not found." });
-        } // Security Check: Only the order owner can view details
-
+        }
         if (order.email !== req.tokenEmail) {
-          // Log this for security monitoring
           console.warn(
             `403 Attempt: User ${req.tokenEmail} tried to access order ${orderId} belonging to ${order.email}`
           );
           return res
             .status(403)
             .send({ message: "Forbidden: Order does not belong to user." });
-        } // Only return essential details needed by the client (PaymentPage)
-
+        }
         res.send({
-          bookTitle: order.bookTitle, // Assuming this field exists in your order schema
+          bookTitle: order.bookTitle,
           price: order.price,
           email: order.email,
           bookId: order.bookId,
           status: order.status,
-          payment_status: order.payment_status, // Include other non-sensitive data needed for display
+          payment_status: order.payment_status,
         });
       } catch (error) {
-        // Handle case where orderId is not a valid ObjectId format
         if (error.name === "BSONTypeError") {
           return res.status(400).send({ message: "Invalid Order ID format." });
         }
@@ -450,7 +427,7 @@ async function run() {
           .status(500)
           .send({ message: "Failed to fetch order details.", error });
       }
-    }); // USER ROUTE: Read My Orders (GET)
+    });
 
     app.get("/my-orders/:email", verifyJWT, async (req, res) => {
       const email = req.params.email;
@@ -466,7 +443,7 @@ async function run() {
         .sort({ orderDate: -1 })
         .toArray();
       res.send(result);
-    }); // USER ROUTE: Read My Invoices (GET)
+    });
 
     app.get("/my-invoices/:email", verifyJWT, async (req, res) => {
       const userEmail = req.params.email;
@@ -483,10 +460,7 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to fetch paid orders." });
       }
-    }); // LIBRARIAN/ADMIN ROUTE: Update Order Fulfillment Status (PATCH)
-
-    // ❌ REMOVED: This specific filtering logic is now handled by the unified app.get("/orders") route above.
-    // app.get( "/librarian-orders/:email", verifyJWT, verifyLibrarian, async (req, res) => { ... });
+    });
 
     app.patch(
       "/orders/update-status/:id",
@@ -521,8 +495,7 @@ async function run() {
           res.status(500).send({ message: "Failed to update order status." });
         }
       }
-    ); // USER ROUTE: Cancel Order (PATCH)
-
+    );
     app.patch("/orders/cancel/:id", verifyJWT, async (req, res) => {
       const id = req.params.id; // Best practice: verify that the order's email field matches req.tokenEmail before updating
       const query = { _id: new ObjectId(id) };
@@ -531,7 +504,7 @@ async function run() {
       };
       const result = await ordersCollection.updateOne(query, updateDoc);
       res.send(result);
-    }); // USER ROUTE: Stripe Checkout Session (POST)
+    });
 
     app.post("/create-checkout-session", verifyJWT, async (req, res) => {
       const { bookTitle, price, email, quantity, orderId } = req.body;
@@ -570,7 +543,7 @@ async function run() {
       } catch (error) {
         res.status(500).send({ error: error.message });
       }
-    }); // USER ROUTE: Handle Payment Success (PATCH)
+    });
 
     app.patch(
       "/orders/payment-success/:orderId",
@@ -580,7 +553,6 @@ async function run() {
         const sessionId = req.body.sessionId;
 
         try {
-          // Should perform Stripe verification here using sessionId
           if (sessionId) {
             const session = await stripe.checkout.sessions.retrieve(sessionId);
             if (session.payment_status !== "paid") {
@@ -615,7 +587,7 @@ async function run() {
             .send({ message: "Failed to update order status.", error });
         }
       }
-    ); // ======================================================= //                  WISHLIST & REVIEW ENDPOINTS // ======================================================= // USER ROUTE: Create Wishlist Item (POST)
+    );
 
     app.post("/wishlist", verifyJWT, async (req, res) => {
       const wishlistData = req.body;
@@ -639,8 +611,7 @@ async function run() {
 
       const result = await wishlistCollection.insertOne(wishlistData);
       res.send(result);
-    }); // USER ROUTE: Read Wishlist (GET)
-
+    });
     app.get("/wishlist/:email", verifyJWT, async (req, res) => {
       const email = req.params.email;
       if (email !== req.tokenEmail) {
@@ -652,15 +623,15 @@ async function run() {
         .find({ userEmail: email })
         .toArray();
       res.send(result);
-    }); // USER ROUTE: Delete Wishlist Item (DELETE)
+    });
 
     app.delete("/wishlist/:id", verifyJWT, async (req, res) => {
-      const id = req.params.id; // Highly recommend checking that the item belongs to req.tokenEmail
+      const id = req.params.id;
       const result = await wishlistCollection.deleteOne({
         _id: new ObjectId(id),
       });
       res.send(result);
-    }); // USER ROUTE: Create Review (POST)
+    });
 
     app.post("/reviews", verifyJWT, async (req, res) => {
       const { bookId, userId, userName, rating, reviewText } = req.body;
@@ -714,7 +685,7 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to submit review." });
       }
-    }); // Public Route: Read Reviews for a Specific Book (GET)
+    });
 
     app.get("/reviews/:bookId", async (req, res) => {
       try {
@@ -727,11 +698,10 @@ async function run() {
       } catch (error) {
         res.status(500).send({ message: "Failed to fetch reviews." });
       }
-    }); // Public Route: Check if User Can Review (GET)
-
+    });
     app.get("/user-can-review/:bookId/:userEmail", async (req, res) => {
       try {
-        const { bookId, userEmail } = req.params; // 1. Check if the user has a 'paid' order for this book
+        const { bookId, userEmail } = req.params;
 
         const hasOrdered = await ordersCollection.findOne({
           bookId: bookId,
@@ -741,8 +711,7 @@ async function run() {
 
         if (!hasOrdered) {
           return res.send({ canReview: false, reason: "NOT_ORDERED" });
-        } // 2. Check if the user has ALREADY submitted a review for this book
-
+        }
         const hasReviewed = await reviewsCollection.findOne({
           bookId: new ObjectId(bookId),
           userId: userEmail,
@@ -762,7 +731,7 @@ async function run() {
           .status(500)
           .send({ message: "Failed to check review eligibility." });
       }
-    }); // --- MongoDB Connection Check ---
+    });
 
     await client.db("admin").command({ ping: 1 });
     console.log(
@@ -774,7 +743,6 @@ async function run() {
 }
 run().catch(console.dir);
 
-// --- Root and Listener ---
 app.get("/", (req, res) => {
   res.send("BookCourier Server is operational and secure.");
 });
