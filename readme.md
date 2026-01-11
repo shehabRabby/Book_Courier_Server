@@ -4,6 +4,17 @@
 
 This repository houses the robust and secure RESTful API that powers the BookCourier application. Built with Node.js and Express.js, it manages all core business logic, database interactions, user authentication, authorization (role-based access control), and secure payment processing.
 
+
+## 🌐 Live Access and Repositories
+
+| Item | Details |
+| :--- | :--- |
+| **Live Site URL** | [https://bookcouriernew.netlify.app/](https://bookcouriernew.netlify.app/) |
+| **Client-Side Repository** | [https://github.com/shehabRabby/Book_Courier_Client](https://github.com/shehabRabby/Book_Courier_Client) |
+| **Server-Side Repository** | [https://github.com/shehabRabby/Book_Courier_Server](https://github.com/shehabRabby/Book_Courier_Server) |
+
+--
+
 ## 🔒 Security and Architecture
 
 ### Key Security Implementations

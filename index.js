@@ -17,13 +17,11 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
-  "https://your-frontend.vercel.app",
-  "https://your-frontend.netlify.app",
-  "https://book-parcel.web.app"
+  "https://bookcouriernew.netlify.app",
+  "https://book-parcel.web.app",
 ];
 
 app.use(
@@ -40,7 +38,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization"]
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -53,9 +51,6 @@ app.use(express.json());
 //     optionSuccessStatus: 200,
 //   })
 // );
-
-
-
 
 // jwt
 const verifyJWT = async (req, res, next) => {
@@ -85,7 +80,6 @@ const client = new MongoClient(process.env.MONGODB_URL, {
     deprecationErrors: true,
   },
 });
-
 
 async function run() {
   try {
